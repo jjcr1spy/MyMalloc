@@ -1,0 +1,2 @@
+MyMalloc: The goal of this project is to build a malloc library that implements a memory allocator, which allows users to malloc() and free() memory as needed. The allocator requests large chunks of
+memory from the OS, and manage all the memory efficiently.

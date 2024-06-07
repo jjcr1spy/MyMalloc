@@ -180,10 +180,13 @@ static header * allocate_chunk(size_t size) {
   void * mem = sbrk(size);
   
   insert_fenceposts(mem, size);
+
   header * hdr = (header *) ((char *)mem + ALLOC_HEADER_SIZE);
+
   set_state(hdr, UNALLOCATED);
   set_size(hdr, size - 2 * ALLOC_HEADER_SIZE);
   hdr->left_size = ALLOC_HEADER_SIZE;
+
   return hdr;
 }
 
@@ -192,75 +195,84 @@ static inline int get_index(int size) {
 }
 
 static void insert_new_chunk() {
-  header * chunk = allocate_chunk(ARENA_SIZE); // allocate new chunk
-  header * prevChunkFence = (header *) ((char *) chunk - 2 * ALLOC_HEADER_SIZE);
-	  
+  header *chunk = allocate_chunk(ARENA_SIZE); // allocate new chunk
+  header *prevChunkFence = (header *)((char *)chunk - 2 * ALLOC_HEADER_SIZE);
+
   if (get_state(prevChunkFence) == FENCEPOST) { // merge the neighboring chunks
-    header * obj = get_left_header(prevChunkFence);
-    if (get_state(obj) == UNALLOCATED) { // merge which new chunk
-      int i = get_size(obj) / 8 - 4 <= N_LISTS - 1 ? get_size(obj) / 8 - 4 : N_LISTS - 1; 
-      if (i != N_LISTS - 1) {
-        obj->next->prev = obj->prev; // remove from freelist
-	obj->prev->next = obj->next;
+      header *obj = get_left_header(prevChunkFence);
 
-	header * sent = &freelistSentinels[N_LISTS - 1];
+      if (get_state(obj) == UNALLOCATED) { // merge which new chunk
+          int i = get_size(obj) / 8 - 4 <= N_LISTS - 1 ? get_size(obj) / 8 - 4 : N_LISTS - 1;
 
-	obj->next = sent->next;
-	obj->prev = sent; 
+          if (i != N_LISTS - 1) {
+              obj->next->prev = obj->prev; // remove from freelist
+              obj->prev->next = obj->next;
 
-	sent->next = obj;
-	obj->next->prev = obj;
+              header *sent = &freelistSentinels[N_LISTS - 1];
+
+              obj->next = sent->next;
+              obj->prev = sent;
+
+              sent->next = obj;
+              obj->next->prev = obj;
+          }
+
+          obj->size_state += ARENA_SIZE;
+
+          header *h = get_right_header(obj);
+          h->left_size = get_size(obj);
+      } else { // block is allocated, so just edit prev chunks last fencepost
+          prevChunkFence->size_state += (ARENA_SIZE - ALLOC_HEADER_SIZE);
+          set_state(prevChunkFence, UNALLOCATED);
+
+          header *sent = &freelistSentinels[N_LISTS - 1];
+
+          prevChunkFence->next = sent->next;
+          prevChunkFence->prev = sent;
+
+          sent->next = prevChunkFence;
+          prevChunkFence->next->prev = prevChunkFence;
+
+          header *h = get_right_header(prevChunkFence);
+
+          h->left_size = get_size(prevChunkFence);
       }
-      obj->size_state += ARENA_SIZE;
-      header * h = get_right_header(obj);
-      h->left_size = get_size(obj);
-    } else { // block is allocated, so just edit prev chunks last fencepost
-      prevChunkFence->size_state += (ARENA_SIZE - ALLOC_HEADER_SIZE);
-      set_state(prevChunkFence, UNALLOCATED);
-   
-      header * sent = &freelistSentinels[N_LISTS - 1];
+  } else { // not neighbors
+      insert_os_chunk((header *)((char *)chunk - ALLOC_HEADER_SIZE));
 
-      prevChunkFence->next = sent->next;
-      prevChunkFence->prev = sent; 
+      header *sent = &freelistSentinels[N_LISTS - 1];
 
-      sent->next = prevChunkFence;
-      prevChunkFence->next->prev = prevChunkFence;
+      chunk->next = sent->next;
+      chunk->prev = sent;
 
-      header * h = get_right_header(prevChunkFence);
-      h->left_size = get_size(prevChunkFence);
-    }
-  } else { // not neighbors 
-    insert_os_chunk((header *) ((char *) chunk - ALLOC_HEADER_SIZE));
-    header * sent = &freelistSentinels[N_LISTS - 1];
-
-    chunk->next = sent->next;
-    chunk->prev = sent;
-
-    sent->next = chunk;
-    chunk->next->prev = chunk;
+      sent->next = chunk;
+      chunk->next->prev = chunk;
   }
 }
 
-static header * find_block(int index, size_t total) {
+static header *find_block(int index, size_t total) {
   while (1) {
-    if (index == N_LISTS - 1) { // when in last index, also make sure size of block >= total
-      header * sent = &freelistSentinels[index];
-      header * iter = sent->next;
-      while (iter != sent) {
-        if (get_size(iter) >= total) {
-	  return iter; // block found
-        }
-        iter = iter->next;
+      if (index == N_LISTS - 1) { // when in last index, also make sure size of block >= total
+          header *sent = &freelistSentinels[index];
+          header *iter = sent->next;
+
+          while (iter != sent) {
+              if (get_size(iter) >= total) {
+                  return iter; // block found
+              }
+
+              iter = iter->next;
+          }
+      } else { // just check if list is simply empty or not when finding block
+          for (int i = index; i < N_LISTS; i++) {
+              header *temp = &freelistSentinels[i];
+              if (temp->next != temp) {
+                  return temp->next;
+              }
+          }
       }
-    } else { // just check if list is simply empty or not when finding block
-      for (int i = index; i < N_LISTS; i++) {		
-        header * temp = &freelistSentinels[i];
-        if (temp->next != temp) {
-          return temp->next;
-        }
-      }
-    }
-    insert_new_chunk();// if we get here, block not found so allocate more memory and search again!
+
+      insert_new_chunk(); // if we get here, block not found so allocate more memory and search again!
   }
 }
 
@@ -292,11 +304,12 @@ static inline header * allocate_object(size_t raw_size) {
 
   if (remainder >= sizeof(header)) { // split the block and add another header 
     header * new_head = get_header_from_offset(target, total); // create new header
+
     set_size_and_state(new_head, remainder, UNALLOCATED);
+
     new_head->left_size = total; 
     
-    int index = get_index(remainder);
-    header * sent = &freelistSentinels[index];
+    header * sent = &freelistSentinels[get_index(remainder)];
 
     new_head->prev = sent; // update prev/next since block is unallocated
     new_head->next = sent->next;
@@ -305,6 +318,7 @@ static inline header * allocate_object(size_t raw_size) {
     new_head->next->prev = new_head;
 	
     header * right = get_right_header(new_head); // update right headers->left_size
+
     right->left_size = remainder;
   } else if (remainder != 0) { // need to add additional bytes for header alignment
     target->size_state += remainder;
@@ -326,21 +340,25 @@ static inline header * ptr_to_header(void * p) {
 
 static void left_unalloc(header * obj, header * left) {
   int index = get_index(get_size(left));
+  
   if (index != N_LISTS - 1) { // make sure not last index of freelist	
     left->prev->next = left->next; // remove from freelist
     left->next->prev = left->prev; 
 
     header * sent = &freelistSentinels[get_index(get_size(obj) + get_size(left))]; // get freelist sentinel
+
     left->prev = sent; // update links
     left->next = sent->next;
     
     sent->next = left; // add to freelist
     left->next->prev = left;
   }
+  
   left->size_state += get_size(obj); // update size and state of header we keep
   set_state(left, UNALLOCATED); 
 
   header * r = get_right_header(left); // update right headers->left_size
+
   r->left_size = get_size(left);
 }
 
@@ -367,6 +385,7 @@ static void right_unalloc(header * obj, header * right) {
     obj->next->prev = obj; // make sure obj's neighbors point to obj not right
     obj->prev->next = obj;
   }
+
   header * r = get_right_header(right); // update right headers->left_size
   r->left_size = get_size(obj);
 }
@@ -405,6 +424,7 @@ static void both_unalloc(header * obj, header * left, header * right) {
     sent->next = left; // add to freelist
     left->next->prev = left;
   }
+  
   header * r = get_right_header(left); // update right headers->left_size
   r->left_size = get_size(left);
 }
